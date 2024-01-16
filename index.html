@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<title>Agent Auto-Monitor</title>
+	
+	<link href="https://stackpath.bootstrapcdn.com/bootstrap/4.1.1/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-WskhaSGFgHYWDcbwN70/dfYBj47jz9qbsMId/iRN3ewGhXQFZCSftd1LZCfmhktB" crossorigin="anonymous">
+
+	<style type="text/css">
+		.row {
+			margin-top: 8px;
+		}
+	</style>
+
+	<script src="https://code.jquery.com/jquery-3.3.1.min.js" integrity="sha256-FgpCb/KJQlLNfOu91ta32o/NMZxltwRo8QtmkMRdAu8=" crossorigin="anonymous"></script>
+	<script src="https://sdk-cdn.mypurecloud.com/javascript/27.0.0/purecloud-platform-client-v2.min.js"></script>
+
+	<script type="text/javascript">
+		// This client ID expects the redirect URL to be http://localhost:8080/
+		const clientId = '5862eb9e-218f-4ab1-b035-fac783be9885';
+		const redirectUri = window.location.href;
+
+		// Set purecloud objects
+		const platformClient = require('platformClient');
+		const client = platformClient.ApiClient.instance;
+		const notificationsApi = new platformClient.NotificationsApi();
+		const routingApi = new platformClient.RoutingApi();
+		const conversationsApi = new platformClient.ConversationsApi();
+
+		// Set PureCloud settings
+		client.setEnvironment('mypurecloud.com');
+		client.setPersistSettings(true, 'BrianAutoMonitor');
+
+		// Local vars
+		let userConversationsTopic = '';
+		let webSocket = null;
+		let notificationChannel, monitoredAgent, conversationId, participantId;
+
+		$(document).ready(() => {
+			// Authenticate with PureCloud
+			client.loginImplicitGrant(clientId, redirectUri)
+			
+				.then(() => {
+					console.log('Logged in');
+
+					// Get queues
+					return getQueues();
+				})
+				
+				.then((queuesListing) => {
+					console.log(`Found ${queuesListing.entities.length} queues`);
+
+					// Create select option for each queue
+					queuesListing.entities.forEach((queue) => {
+						var option = document.createElement("option");
+						option.text = queue.name;	//user-friendly name
+						option.value = queue.id;		//PureCloud queueId
+						document.getElementById("queuesDropDown").add(option);
+					});
+				})
+				
+				.then(() => {
+					// Create notification channel
+					return notificationsApi.postNotificationsChannels();
+				})
+				
+				.then((channel) => {
+					console.log('channel: ', channel);
+					notificationChannel = channel;
+
+					// Set up web socket
+					webSocket = new WebSocket(notificationChannel.connectUri);
+					webSocket.onmessage = handleNotification;
+				})
+
+				.catch((err) => console.error(err));
+		});
+		
+		//Retrieve up to 100 PureCloud queue objects
+		function getQueues() {
+			return routingApi.getRoutingQueues({"pageSize": "100"});
+		}
+		
+		//Retrieve up to 100 PureCloud members of given queue as user objects
+		function getAgents(queueId) {
+			return routingApi.getRoutingQueueUsers(queueId, {"pageSize": "100"});
+		}
+		
+		//Clear agents drop-down and refill with members of PureCloud queueId
+		function updateAgents(queueId) {
+			agentsDropDown = document.getElementById("agentsDropDown");
+			console.log(`Removing ${agentsDropDown.options.length} agents from menu`)
+			while (agentsDropDown.options.length) {
+				agentsDropDown.remove(0);
+			}
+			getAgents(queueId)
+			.then((agentsListing) => {
+				//Create select option for each agent
+				console.log(`Adding ${agentsListing.entities.length} agents to menu`)
+				agentsListing.entities.forEach((user) => {
+					var option = document.createElement("option");
+					option.text = user.name;		//user-friendly agent name
+					option.value = user.id;		//PureCloud userId
+					document.getElementById("agentsDropDown").add(option);
+				});
+			});
+		}
+
+		//Subscribe to conversation notifications for PureCloud userId
+		function setAgent(agentId) {
+			console.log(`Setting agent to (${agentId})`);
+			monitoredAgent = agentId;
+			userConversationsTopic = `v2.users.${monitoredAgent}.conversations`;
+			return notificationsApi.putNotificationsChannelSubscriptions(notificationChannel.id, [ { id: userConversationsTopic } ]);
+		}
+
+		// Handle incoming PureCloud notification from WebSocket
+		function handleNotification(message) {
+			// Parse notification string to a JSON object
+			const notification = JSON.parse(message.data);
+
+			// Discard unwanted notifications
+			if (notification.topicName.toLowerCase() === 'channel.metadata') {
+				// Heartbeat
+				console.info('Ignoring metadata: ', notification);
+				return;
+			} else if (notification.topicName.toLowerCase() !== userConversationsTopic.toLowerCase()) {
+				// Unexpected topic
+				console.warn('Unknown notification: ', notification);
+				return;
+			} else {
+				console.debug('Conversation notification: ', notification);
+			}
+
+			//If this is the first connected notification for the agent participant, begin a silent monitor on call
+			if (notification.eventBody.participants.filter(participant => participant.purpose === "agent")[0].calls[0].state === "connected" && conversationId != notification.eventBody.id) {
+				conversationId = notification.eventBody.id;
+				participantId = notification.eventBody.participants.filter(participant => participant.purpose === "agent")[0].id;
+				console.info("participant.id: ", notification.eventBody.participants.filter(participant => participant.purpose === "agent")[0].id);
+				conversationsApi.postConversationsCallParticipantMonitor(conversationId, participantId)
+					.catch((err) => console.log(`${new Date().toLocaleTimeString()} - ${JSON.stringify(err,null,2)}`));
+			}
+		}
+		
+
+	</script>
+</head>
+<body>
+	<div class="container">
+		<div class="row">
+			<div class="col-sm-12">
+				<select id="queuesDropDown" onchange="updateAgents(this.value)"></select>
+				<select id="agentsDropDown" onchange="setAgent(this.value)"></select>
+			</div>
+		</div>
+	</div>
+</body>
+</html>
